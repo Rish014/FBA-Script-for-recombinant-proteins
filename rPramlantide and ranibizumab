@@ -1,0 +1,95 @@
+%% Complete COBRA FBA Script with Demand Reactions
+% Case study: Symlin & Ranibizumab (HC & LC) in E. coli BL21 (iJO1366 model)
+
+initCobraToolbox(false);
+changeCobraSolver('gurobi','LP'); % or 'glpk' if gurobi unavailable
+
+%% Load the iJO1366 model
+model = readCbModel('iJO1366.mat');
+
+%% --- Add Pseudo-reaction for Symlin (37 aa) ---
+symlinMets = {'ala__L_c','cys__L_c','asp__L_c','glu__L_c','phe__L_c','gly_c','his__L_c','ile__L_c','leu__L_c','lys__L_c','met__L_c','asn__L_c','pro__L_c','gln__L_c','arg__L_c','ser__L_c','thr__L_c','val__L_c','tyr__L_c','atp_c','gtp_c','h2o_c'};
+symlinCoeffs = [-3,-2,-3,-3,-2,-3,-1,-1,-4,-2,-1,-1,-2,-1,-2,-3,-2,-2,-1,-148,-74,-222];
+symlinMetsProd = {'symlin_c','adp_c','gdp_c','pi_c','h_c'};
+symlinCoeffsProd = [1,148,74,222,222];
+symlinMetsFinal = [symlinMets, symlinMetsProd];
+symlinCoeffsFinal = [symlinCoeffs, symlinCoeffsProd];
+model = addReaction(model,'SYMLIN_txn','metaboliteList',symlinMetsFinal,'stoichCoeffList',symlinCoeffsFinal,'reversible',false);
+model = addDemandReaction(model,'symlin_c');
+
+%% --- Add Pseudo-reaction for Ranibizumab Heavy Chain (231 aa) ---
+HC_mets = {'ala__L_c','cys__L_c','asp__L_c','glu__L_c','phe__L_c','gly_c','his__L_c','ile__L_c','leu__L_c','lys__L_c','met__L_c','asn__L_c','pro__L_c','gln__L_c','arg__L_c','ser__L_c','thr__L_c','val__L_c','trp__L_c','tyr__L_c','atp_c','gtp_c','h2o_c'};
+HC_coeffs = [-15,-5,-8,-7,-8,-22,-5,-2,-18,-13,-2,-7,-13,-7,-5,-30,-22,-21,-6,-15,-924,-462,-1386];
+HC_prodMets = {'ranibizumab_HC_c','adp_c','gdp_c','pi_c','h_c'};
+HC_prodCoeffs = [1,924,462,1386,1386];
+HC_metsFinal = [HC_mets, HC_prodMets];
+HC_coeffsFinal = [HC_coeffs, HC_prodCoeffs];
+model = addReaction(model,'RANIBIZUMAB_HC_txn','metaboliteList',HC_metsFinal,'stoichCoeffList',HC_coeffsFinal,'reversible',false);
+model = addDemandReaction(model,'ranibizumab_HC_c');
+
+%% --- Add Pseudo-reaction for Ranibizumab Light Chain (214 aa) ---
+LC_mets = {'ala__L_c','cys__L_c','asp__L_c','glu__L_c','phe__L_c','gly_c','his__L_c','ile__L_c','leu__L_c','lys__L_c','met__L_c','asn__L_c','pro__L_c','gln__L_c','arg__L_c','ser__L_c','thr__L_c','val__L_c','trp__L_c','tyr__L_c','atp_c','gtp_c','h2o_c'};
+LC_coeffs = [-11,-5,-10,-9,-10,-12,-3,-7,-15,-13,-0,-7,-11,-15,-5,-34,-19,-16,-3,-10,-856,-428,-1284];
+LC_prodMets = {'ranibizumab_LC_c','adp_c','gdp_c','pi_c','h_c'};
+LC_prodCoeffs = [1,856,428,1284,1284];
+LC_metsFinal = [LC_mets, LC_prodMets];
+LC_coeffsFinal = [LC_coeffs, LC_prodCoeffs];
+model = addReaction(model,'RANIBIZUMAB_LC_txn','metaboliteList',LC_metsFinal,'stoichCoeffList',LC_coeffsFinal,'reversible',false);
+model = addDemandReaction(model,'ranibizumab_LC_c');
+
+%% --- Define substrate uptake constraints ---
+strategies = {'L','LG','IG'};
+substrates = {
+    [-10, -5, 0, -15];   % L: Glucose + Lactose
+    [0, -5, -8, -15];    % LG: Lactose + Glycerol
+    [0, 0, -8, -15];     % IG: Glycerol only
+};
+
+%% --- Run FBA ---
+results = table('Size',[0 5], ...
+    'VariableTypes',{'string','double','double','double','double'}, ...
+    'VariableNames',{'Condition','Biomass','SymlinFlux','Ranibizumab_HC','Ranibizumab_LC'});
+
+for i = 1:length(strategies)
+    cond = strategies{i};
+    uptake = substrates{i};
+
+    % Reset bounds
+    tempModel = changeRxnBounds(model,'EX_glc__D_e',0,'b');
+    tempModel = changeRxnBounds(tempModel,'EX_lac__D_e',0,'b');
+    tempModel = changeRxnBounds(tempModel,'EX_glyc_e',0,'b');
+    tempModel = changeRxnBounds(tempModel,'EX_o2_e',0,'b');
+
+    % Apply uptake
+    tempModel = changeRxnBounds(tempModel,'EX_glc__D_e',uptake(1),'l');
+    tempModel = changeRxnBounds(tempModel,'EX_lac__D_e',uptake(2),'l');
+    tempModel = changeRxnBounds(tempModel,'EX_glyc_e',uptake(3),'l');
+    tempModel = changeRxnBounds(tempModel,'EX_o2_e',uptake(4),'l');
+
+    % Biomass
+    modelBiomass = changeObjective(tempModel,'BIOMASS_Ec_iJO1366_core_53p95M');
+    FBAbiomass = optimizeCbModel(modelBiomass,'max');
+
+    % Symlin production
+    modelSymlin = changeObjective(tempModel,'DM_symlin_c');
+    FBAsymlin = optimizeCbModel(modelSymlin,'max');
+
+    % Ranibizumab Heavy Chain
+    modelHC = changeObjective(tempModel,'DM_ranibizumab_HC_c');
+    FBAhc = optimizeCbModel(modelHC,'max');
+
+    % Ranibizumab Light Chain
+    modelLC = changeObjective(tempModel,'DM_ranibizumab_LC_c');
+    FBAlc = optimizeCbModel(modelLC,'max');
+
+    % Save results
+    results = [results; {cond, FBAbiomass.f, FBAsymlin.f, FBAhc.f, FBAlc.f}];
+end
+
+%% --- Display results ---
+disp('--- Extended FBA Results (Biomass, Symlin, Ranibizumab HC, LC) ---');
+disp(results);
+
+%% --- Save output ---
+writetable(results,'FBA_Recombinant_Protein_Results_HC_LC.csv');
+  
