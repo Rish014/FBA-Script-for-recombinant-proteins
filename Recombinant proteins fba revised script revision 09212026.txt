@@ -1,0 +1,615 @@
+%% ========================================================================
+% FBA_Revised_TwoProtein_Sensitivity_20260915.m
+%
+% Resource-constrained FBA for recombinant rPramlintide
+% and Ranibizumab Fab production in E. coli.
+%
+% IMPORTANT MODEL FEATURES (To Do List)
+%   1. Starts and configures the COBRA Toolbox.
+%   2. Uses the lactose exchange EX_lcts_e (not D-lactate EX_lac__D_e).
+%   3. Represents the post-induction production phase; glucose uptake is 0.
+%   4. Enforces biomass >= 10% of the condition-specific maximum while
+%      maximizing recombinant protein production.
+%   5. Adds explicit translation-capacity, folding-ATP, folding-capacity,
+%      soluble-product, and inclusion-body terms.
+%   6. Requires 1 heavy chain + 1 light chain to assemble one Ranibizumab
+%      Fab molecule.
+%   7. Uses broad sensitivity ranges rather than fitting resource parameters
+%      to the same experimental yields used for validation.
+%   8. Converts experimental g/gDW/h values to mmol/gDW/h before computing
+%      percentage realization.
+%   9. Exports ideal, constrained, inclusion-body, and
+%      parameter-specific sensitivity tables.
+%
+% Interpretation limits:
+%   This is a resource-constrained stoichiometric sensitivity model, not a
+%   calibrated enzyme-constrained model. Parameter ranges are exploratory and
+%   reported as assumptions. Realization percentages are not capped
+%   at 100%; values >100 indicate unit/model/constraint inconsistency.
+%% ========================================================================
+
+clearvars;
+clc;
+
+%% 1. Initialize COBRA Toolbox and solver
+initCobraToolbox(false);
+changeCobraSolver('glpk','LP');
+
+modelFile = 'iJO1366.mat';
+if exist(modelFile,'file') ~= 2
+    error('Model file %s was not found in the current MATLAB path.',modelFile);
+end
+
+baseModel = readCbModel(modelFile);
+
+biomassRxn = 'BIOMASS_Ec_iJO1366_core_53p95M';
+atpmRxn = 'ATPM';
+requiredRxns = {biomassRxn,atpmRxn,'EX_glc__D_e','EX_lcts_e', ...
+                'EX_glyc_e','EX_o2_e'};
+assertModelHasRxns(baseModel,requiredRxns);
+
+baseModel = changeRxnBounds(baseModel,atpmRxn,5.17,'l');
+
+%% 2. Analysis settings
+growthFraction = 0.10;  % retain at least 10% of maximum growth
+
+% The production-phase model excludes glucose after the initial glucose
+% priming phase. IPTG is not metabolized and therefore has no exchange flux.
+conditions(1) = struct('name',"L",  'glucose',0,'lactose',-8,'glycerol',0,  'oxygen',-18);
+conditions(2) = struct('name',"L+G",'glucose',0,'lactose',-8,'glycerol',-12,'oxygen',-18);
+conditions(3) = struct('name',"I+G",'glucose',0,'lactose',0, 'glycerol',-12,'oxygen',-18);
+
+% Full-factorial sensitivity ranges: 3^4 = 81 scenarios per product and
+% condition. Higher translationEfficiency lowers ribosome demand per product.
+sensitivity.translationEfficiency = [0.50, 1.00, 1.50];
+sensitivity.foldingATPmultiplier   = [0.50, 1.00, 1.50];
+% Broad exploratory capacity range; the lower levels allow this constraint
+% to become active instead of remaining numerically non-binding.
+sensitivity.foldingCapacity       = [0.05, 0.20, 1.00];
+sensitivity.solubleFraction       = [0.30, 0.60, 0.90];
+
+resource.ribosomeCapacity = 12;  % exploratory aa-equivalent capacity
+
+%% 3. Protein definitions
+aaMets = {'ala__L_c','cys__L_c','asp__L_c','glu__L_c','phe__L_c', ...
+          'gly_c','his__L_c','ile__L_c','leu__L_c','lys__L_c', ...
+          'met__L_c','asn__L_c','pro__L_c','gln__L_c','arg__L_c', ...
+          'ser__L_c','thr__L_c','val__L_c','trp__L_c','tyr__L_c'};
+
+% rPramlintide trimeric construct: 123 aa, approximately 13.6 kDa.
+protein(1).id = 'rPramlintide';
+protein(1).label = "rPramlintide";
+protein(1).kind = 'single';
+protein(1).MW_g_per_mmol = 13.6;
+protein(1).aaMets = aaMets;
+protein(1).aaCoeff = [-9,-6,0,-1,-6,-6,-9,-3,-10,-3,-1,-18,-9,-3,-3,-9,-15,-6,-3,-3];
+protein(1).length = 123;
+protein(1).foldATPperAA = 2;
+protein(1).chaperoneCost = 3;
+
+% Ranibizumab Fab: one 231-aa HC plus one 214-aa LC, approximately 48 kDa.
+protein(2).id = 'Ranibizumab';
+protein(2).label = "Ranibizumab";
+protein(2).kind = 'fab';
+protein(2).MW_g_per_mmol = 48.0;
+protein(2).aaMets = aaMets;
+protein(2).HCaaCoeff = [-15,-5,-8,-7,-8,-22,-5,-2,-18,-13,-2,-7,-13,-7,-5,-30,-22,-21,-6,-15];
+% The earlier draft used Ser = 34, which summed to 217 residues. Ser = 31
+% gives the stated 214-residue LC composition.
+protein(2).LCaaCoeff = [-11,-5,-10,-9,-10,-12,-3,-7,-15,-13,-2,-7,-11,-15,-5,-31,-19,-16,-3,-10];
+protein(2).aaCoeff = protein(2).HCaaCoeff + protein(2).LCaaCoeff;
+protein(2).HClength = 231;
+protein(2).LClength = 214;
+protein(2).length = protein(2).HClength + protein(2).LClength;
+protein(2).foldATPperAA = 4;
+protein(2).HCchaperoneCost = 5;
+protein(2).LCchaperoneCost = 5;
+
+% Confirm that amino-acid counts match the stated sequence lengths.
+for p = 1:numel(protein)
+    if round(-sum(protein(p).aaCoeff)) ~= protein(p).length
+        error('%s amino-acid coefficients do not sum to the stated length.',protein(p).id);
+    end
+end
+
+%% 4. Experimental mass yields and unit conversion
+% Values are entered in g protein/gDW/h and converted to mmol/gDW/h using
+% molecular weight in g/mmol. These are validation data, not model inputs.
+experimental = table( ...
+    ["L";"L+G";"I+G"], ...
+    [0.0204;0.0950;0.0280], [0.00306;0.00500;0.01200], ...
+    [0.00180;0.0032175;0.00380], [0.00150;0.00320;0.00340], ...
+    'VariableNames',{'Condition','rPramlintideSol_g_gDW_h', ...
+    'rPramlintideIB_g_gDW_h','RanibizumabSol_g_gDW_h', ...
+    'RanibizumabIB_g_gDW_h'});
+
+experimental.rPramlintideSol_mmol_gDW_h = ...
+    experimental.rPramlintideSol_g_gDW_h ./ protein(1).MW_g_per_mmol;
+experimental.rPramlintideIB_mmol_gDW_h = ...
+    experimental.rPramlintideIB_g_gDW_h ./ protein(1).MW_g_per_mmol;
+experimental.RanibizumabSol_mmol_gDW_h = ...
+    experimental.RanibizumabSol_g_gDW_h ./ protein(2).MW_g_per_mmol;
+experimental.RanibizumabIB_mmol_gDW_h = ...
+    experimental.RanibizumabIB_g_gDW_h ./ protein(2).MW_g_per_mmol;
+
+%% 5. Condition-specific maximum growth
+growthRows = cell(0,3);
+for c = 1:numel(conditions)
+    conditionModel = applyProductionMedium(baseModel,conditions(c));
+    conditionModel = changeObjective(conditionModel,biomassRxn);
+    growthSol = optimizeCbModel(conditionModel,'max');
+    requireOptimalSolution(growthSol,"maximum growth",conditions(c).name);
+    growthRows(end+1,:) = {conditions(c).name,growthSol.f, ...
+                           growthFraction*growthSol.f}; %#ok<SAGROW>
+end
+growthTable = cell2table(growthRows,'VariableNames', ...
+    {'Condition','MaximumGrowth_h_1','RequiredGrowth_h_1'});
+
+%% 6. Ideal FBA with correct units, media, growth coupling, and Fab assembly
+idealRows = cell(0,15);
+for p = 1:numel(protein)
+    for c = 1:numel(conditions)
+        maxGrowth = growthTable.MaximumGrowth_h_1(c);
+        minGrowth = growthTable.RequiredGrowth_h_1(c);
+        conditionModel = applyProductionMedium(baseModel,conditions(c));
+        conditionModel = changeRxnBounds(conditionModel,biomassRxn,minGrowth,'l');
+        idealModel = addIdealProteinPathway(conditionModel,protein(p));
+        objectiveRxn = idealObjectiveRxn(protein(p));
+        idealModel = changeObjective(idealModel,objectiveRxn);
+        sol = optimizeCbModel(idealModel,'max');
+        requireOptimalSolution(sol,"ideal protein production",conditions(c).name);
+
+        achievedGrowth = fluxByRxn(sol,idealModel,biomassRxn);
+        expSol = experimentalSoluble(experimental,conditions(c).name,protein(p));
+        expIB = experimentalIB(experimental,conditions(c).name,protein(p));
+        predictedSol = sol.f;
+        predictedIB = 0;
+        predictedTotal = predictedSol;
+
+        idealRows(end+1,:) = {protein(p).label,conditions(c).name, ...
+            maxGrowth,minGrowth,achievedGrowth,predictedSol,predictedIB, ...
+            predictedTotal,expSol,expIB,expSol+expIB, ...
+            safePercent(expSol,predictedSol),NaN, ...
+            safePercent(expSol+expIB,predictedTotal),"optimal"}; %#ok<SAGROW>
+    end
+end
+
+idealResults = cell2table(idealRows,'VariableNames', ...
+    {'Product','Condition','MaximumGrowth_h_1','RequiredGrowth_h_1', ...
+     'AchievedGrowth_h_1','IdealSoluble_mmol_gDW_h','IdealIB_mmol_gDW_h', ...
+     'IdealTotal_mmol_gDW_h','ExperimentalSoluble_mmol_gDW_h', ...
+     'ExperimentalIB_mmol_gDW_h','ExperimentalTotal_mmol_gDW_h', ...
+     'SolubleRealization_percent','IBRealization_percent', ...
+     'TotalRealization_percent','OptimizationStatus'});
+
+%% 7. Full-factorial resource-constrained sensitivity analysis
+scenarioRows = cell(0,19);
+scenarioID = 0;
+
+for p = 1:numel(protein)
+    for c = 1:numel(conditions)
+        maxGrowth = growthTable.MaximumGrowth_h_1(c);
+        minGrowth = growthTable.RequiredGrowth_h_1(c);
+        expSol = experimentalSoluble(experimental,conditions(c).name,protein(p));
+        expIB = experimentalIB(experimental,conditions(c).name,protein(p));
+
+        for te = sensitivity.translationEfficiency
+            for fa = sensitivity.foldingATPmultiplier
+                for fc = sensitivity.foldingCapacity
+                    for sf = sensitivity.solubleFraction
+                        scenarioID = scenarioID + 1;
+                        parameters.translationEfficiency = te;
+                        parameters.foldingATPmultiplier = fa;
+                        parameters.foldingCapacity = fc;
+                        parameters.solubleFraction = sf;
+                        parameters.ribosomeCapacity = resource.ribosomeCapacity;
+
+                        scenarioModel = applyProductionMedium(baseModel,conditions(c));
+                        scenarioModel = changeRxnBounds(scenarioModel,biomassRxn,minGrowth,'l');
+                        scenarioModel = addResourceConstrainedPathway( ...
+                            scenarioModel,protein(p),parameters);
+                        scenarioModel = changeObjective(scenarioModel, ...
+                            resourceObjectiveRxn(protein(p)));
+                        sol = optimizeCbModel(scenarioModel,'max');
+
+                        if isOptimalSolution(sol)
+                            achievedGrowth = fluxByRxn(sol,scenarioModel,biomassRxn);
+                            solubleFlux = fluxByRxn(sol,scenarioModel, ...
+                                resourceObjectiveRxn(protein(p)));
+                            ibFlux = fluxByRxn(sol,scenarioModel, ...
+                                resourceIBDemandRxn(protein(p)));
+                            totalFlux = solubleFlux + ibFlux;
+                            status = "optimal";
+                        else
+                            achievedGrowth = NaN;
+                            solubleFlux = NaN;
+                            ibFlux = NaN;
+                            totalFlux = NaN;
+                            status = "infeasible";
+                        end
+
+                        scenarioRows(end+1,:) = {protein(p).label,conditions(c).name, ...
+                            scenarioID,te,fa,fc,sf,maxGrowth,minGrowth,achievedGrowth, ...
+                            solubleFlux,ibFlux,totalFlux,expSol,expIB, ...
+                            safePercent(expSol,solubleFlux),safePercent(expIB,ibFlux), ...
+                            safePercent(expSol+expIB,totalFlux),status}; %#ok<SAGROW>
+                    end
+                end
+            end
+        end
+    end
+end
+
+scenarioResults = cell2table(scenarioRows,'VariableNames', ...
+    {'Product','Condition','ScenarioID','TranslationEfficiency', ...
+     'FoldingATPmultiplier','FoldingCapacity','SolubleFraction', ...
+     'MaximumGrowth_h_1','RequiredGrowth_h_1','AchievedGrowth_h_1', ...
+     'PredictedSoluble_mmol_gDW_h','PredictedIB_mmol_gDW_h', ...
+     'PredictedTotal_mmol_gDW_h','ExperimentalSoluble_mmol_gDW_h', ...
+     'ExperimentalIB_mmol_gDW_h','SolubleRealization_percent', ...
+     'IBRealization_percent','TotalRealization_percent','OptimizationStatus'});
+
+%% 8. Sensitivity summary, including inclusion bodies
+summaryRows = cell(0,28);
+for p = 1:numel(protein)
+    for c = 1:numel(conditions)
+        productName = protein(p).label;
+        conditionName = conditions(c).name;
+        use = scenarioResults.Product == productName & ...
+              scenarioResults.Condition == conditionName & ...
+              scenarioResults.OptimizationStatus == "optimal";
+        subset = scenarioResults(use,:);
+        if height(subset) == 0
+            error('No feasible scenarios for %s under %s.',productName,conditionName);
+        end
+
+        idealUse = idealResults.Product == productName & ...
+                   idealResults.Condition == conditionName;
+        expSol = subset.ExperimentalSoluble_mmol_gDW_h(1);
+        expIB = subset.ExperimentalIB_mmol_gDW_h(1);
+
+        solStats = percentileTriplet(subset.PredictedSoluble_mmol_gDW_h);
+        ibStats = percentileTriplet(subset.PredictedIB_mmol_gDW_h);
+        totalStats = percentileTriplet(subset.PredictedTotal_mmol_gDW_h);
+        solRealStats = percentileTriplet(subset.SolubleRealization_percent);
+        ibRealStats = percentileTriplet(subset.IBRealization_percent);
+        totalRealStats = percentileTriplet(subset.TotalRealization_percent);
+
+        summaryRows(end+1,:) = {productName,conditionName, ...
+            subset.MaximumGrowth_h_1(1),subset.RequiredGrowth_h_1(1), ...
+            idealResults.IdealTotal_mmol_gDW_h(idealUse),expSol,expIB,expSol+expIB, ...
+            solStats(2),solStats(1),solStats(3), ...
+            ibStats(2),ibStats(1),ibStats(3), ...
+            totalStats(2),totalStats(1),totalStats(3), ...
+            solRealStats(2),solRealStats(1),solRealStats(3), ...
+            ibRealStats(2),ibRealStats(1),ibRealStats(3), ...
+            totalRealStats(2),totalRealStats(1),totalRealStats(3), ...
+            height(subset),realizationFlag(totalRealStats(2))}; %#ok<SAGROW>
+    end
+end
+
+sensitivitySummary = cell2table(summaryRows,'VariableNames', ...
+    {'Product','Condition','MaximumGrowth_h_1','RequiredGrowth_h_1', ...
+     'IdealTotalCapacity_mmol_gDW_h','ExperimentalSoluble_mmol_gDW_h', ...
+     'ExperimentalIB_mmol_gDW_h','ExperimentalTotal_mmol_gDW_h', ...
+     'MedianPredictedSoluble_mmol_gDW_h','P05PredictedSoluble_mmol_gDW_h', ...
+     'P95PredictedSoluble_mmol_gDW_h','MedianPredictedIB_mmol_gDW_h', ...
+     'P05PredictedIB_mmol_gDW_h','P95PredictedIB_mmol_gDW_h', ...
+     'MedianPredictedTotal_mmol_gDW_h','P05PredictedTotal_mmol_gDW_h', ...
+     'P95PredictedTotal_mmol_gDW_h','MedianSolubleRealization_percent', ...
+     'P05SolubleRealization_percent','P95SolubleRealization_percent', ...
+     'MedianIBRealization_percent','P05IBRealization_percent', ...
+     'P95IBRealization_percent','MedianTotalRealization_percent', ...
+     'P05TotalRealization_percent','P95TotalRealization_percent', ...
+     'FeasibleScenarioCount','RealizationFlag'});
+
+%% 9. Parameter-specific sensitivity and largest-effect constraint
+parameterNames = ["TranslationEfficiency","FoldingATPmultiplier", ...
+                  "FoldingCapacity","SolubleFraction"];
+parameterRows = cell(0,9);
+driverRows = cell(0,5);
+
+for p = 1:numel(protein)
+    for c = 1:numel(conditions)
+        use = scenarioResults.Product == protein(p).label & ...
+              scenarioResults.Condition == conditions(c).name & ...
+              scenarioResults.OptimizationStatus == "optimal";
+        subset = scenarioResults(use,:);
+        effectByParameter = zeros(numel(parameterNames),1);
+
+        for q = 1:numel(parameterNames)
+            parameterName = parameterNames(q);
+            levels = unique(subset.(char(parameterName)));
+            levelMedians = NaN(numel(levels),1);
+            levelIBMedians = NaN(numel(levels),1);
+
+            for k = 1:numel(levels)
+                atLevel = subset.(char(parameterName)) == levels(k);
+                levelMedians(k) = linearPercentile( ...
+                    subset.PredictedSoluble_mmol_gDW_h(atLevel),50);
+                levelIBMedians(k) = linearPercentile( ...
+                    subset.PredictedIB_mmol_gDW_h(atLevel),50);
+            end
+
+            bestMedian = max(levelMedians);
+            worstMedian = min(levelMedians);
+            effectByParameter(q) = safePercent(bestMedian-worstMedian,bestMedian);
+
+            for k = 1:numel(levels)
+                reduction = safePercent(bestMedian-levelMedians(k),bestMedian);
+                parameterRows(end+1,:) = {protein(p).label,conditions(c).name, ...
+                    parameterName,levels(k),levelMedians(k),levelIBMedians(k), ...
+                    reduction,effectByParameter(q),height(subset)}; %#ok<SAGROW>
+            end
+        end
+
+        [largestEffect,largestIndex] = max(effectByParameter);
+        driverRows(end+1,:) = {protein(p).label,conditions(c).name, ...
+            parameterNames(largestIndex),largestEffect, ...
+            "Largest median soluble-capacity change across tested range"}; %#ok<SAGROW>
+    end
+end
+
+parameterSensitivity = cell2table(parameterRows,'VariableNames', ...
+    {'Product','Condition','Parameter','ParameterLevel', ...
+     'MedianPredictedSoluble_mmol_gDW_h','MedianPredictedIB_mmol_gDW_h', ...
+     'ReductionFromBestLevel_percent','FullRangeEffect_percent', ...
+     'ScenariosInProductCondition'});
+
+largestConstraintEffect = cell2table(driverRows,'VariableNames', ...
+    {'Product','Condition','LargestEffectParameter', ...
+     'LargestRangeEffect_percent','Interpretation'});
+
+%% 10. Display and export all results
+fprintf('\n=== IDEAL FBA WITH GROWTH COUPLING AND CORRECT UNITS ===\n');
+disp(idealResults);
+
+fprintf('\n=== RESOURCE-CONSTRAINED SENSITIVITY SUMMARY ===\n');
+fprintf('Each product-condition contains 81 scenarios. Values are median and 5th-95th percentiles.\n');
+disp(sensitivitySummary);
+
+fprintf('\n=== LARGEST PARAMETER EFFECT BY PRODUCT AND CONDITION ===\n');
+disp(largestConstraintEffect);
+
+outputStem = 'FBA_ReviewerRevised_TwoProtein_Sensitivity_v3_20260915';
+outputWorkbook = [outputStem '_results.xlsx'];
+if exist(outputWorkbook,'file') == 2
+    delete(outputWorkbook);
+end
+
+writetable(experimental,outputWorkbook,'Sheet','Experimental_Converted');
+writetable(growthTable,outputWorkbook,'Sheet','Growth_Constraints');
+writetable(idealResults,outputWorkbook,'Sheet','Ideal_FBA');
+writetable(sensitivitySummary,outputWorkbook,'Sheet','Sensitivity_Summary');
+writetable(parameterSensitivity,outputWorkbook,'Sheet','Parameter_Sensitivity');
+writetable(largestConstraintEffect,outputWorkbook,'Sheet','Largest_Constraint_Effect');
+writetable(scenarioResults,outputWorkbook,'Sheet','All_81_Scenarios');
+
+writetable(idealResults,[outputStem '_Ideal_FBA.csv']);
+writetable(sensitivitySummary,[outputStem '_Sensitivity_Summary.csv']);
+writetable(parameterSensitivity,[outputStem '_Parameter_Sensitivity.csv']);
+writetable(largestConstraintEffect,[outputStem '_Largest_Constraint_Effect.csv']);
+writetable(scenarioResults,[outputStem '_All_81_Scenarios.csv']);
+
+save([outputStem '_workspace.mat'],'experimental','growthTable','idealResults', ...
+    'sensitivitySummary','parameterSensitivity','largestConstraintEffect', ...
+    'scenarioResults','conditions','sensitivity','protein');
+
+fprintf('\nAnalysis complete. Main workbook: %s\n',outputWorkbook);
+
+%% ========================================================================
+% Local functions
+%% ========================================================================
+
+function model = applyProductionMedium(model,condition)
+    exchangeRxns = {'EX_glc__D_e','EX_lcts_e','EX_glyc_e','EX_o2_e'};
+    assertModelHasRxns(model,exchangeRxns);
+    for j = 1:numel(exchangeRxns)
+        model = changeRxnBounds(model,exchangeRxns{j},0,'b');
+    end
+    model = changeRxnBounds(model,'EX_glc__D_e',condition.glucose,'l');
+    model = changeRxnBounds(model,'EX_lcts_e',condition.lactose,'l');
+    model = changeRxnBounds(model,'EX_glyc_e',condition.glycerol,'l');
+    model = changeRxnBounds(model,'EX_o2_e',condition.oxygen,'l');
+end
+
+function model = addIdealProteinPathway(model,p)
+    if strcmp(p.kind,'single')
+        mets = [p.aaMets,{'atp_c','gtp_c','h2o_c', ...
+            'rpram_ideal_sol_c','adp_c','gdp_c','pi_c','h_c'}];
+        coeff = [p.aaCoeff,-4*p.length,-2*p.length,-6*p.length, ...
+            1,4*p.length,2*p.length,6*p.length,6*p.length];
+        model = addReaction(model,'RPRAM_IDEAL_SYN', ...
+            'metaboliteList',mets,'stoichCoeffList',coeff,'reversible',false);
+        model = addDemandReaction(model,'rpram_ideal_sol_c');
+    else
+        mets = [p.aaMets,{'atp_c','gtp_c','h2o_c', ...
+            'rani_ideal_fab_sol_c','adp_c','gdp_c','pi_c','h_c'}];
+        coeff = [p.aaCoeff,-4*p.length,-2*p.length,-6*p.length, ...
+            1,4*p.length,2*p.length,6*p.length,6*p.length];
+        model = addReaction(model,'RANI_IDEAL_SYN_ASSEMBLY', ...
+            'metaboliteList',mets,'stoichCoeffList',coeff,'reversible',false);
+        model = addDemandReaction(model,'rani_ideal_fab_sol_c');
+    end
+end
+
+function rxn = idealObjectiveRxn(p)
+    if strcmp(p.kind,'single')
+        rxn = 'DM_rpram_ideal_sol_c';
+    else
+        rxn = 'DM_rani_ideal_fab_sol_c';
+    end
+end
+
+function model = addResourceConstrainedPathway(model,p,par)
+    model = addMetabolite(model,'ribo_pool_c','c');
+    model = addMetabolite(model,'chap_pool_c','c');
+    model = addReaction(model,'RIBO_SUPPLY', ...
+        'metaboliteList',{'ribo_pool_c'},'stoichCoeffList',1,'reversible',false);
+    model = changeRxnBounds(model,'RIBO_SUPPLY',0,'l');
+    model = changeRxnBounds(model,'RIBO_SUPPLY',par.ribosomeCapacity,'u');
+    model = addReaction(model,'CHAP_SUPPLY', ...
+        'metaboliteList',{'chap_pool_c'},'stoichCoeffList',1,'reversible',false);
+    model = changeRxnBounds(model,'CHAP_SUPPLY',0,'l');
+    model = changeRxnBounds(model,'CHAP_SUPPLY',par.foldingCapacity,'u');
+
+    ribosomeCost = p.length/par.translationEfficiency;
+
+    if strcmp(p.kind,'single')
+        txnMets = [p.aaMets,{'atp_c','gtp_c','h2o_c','ribo_pool_c', ...
+            'rpram_unfolded_c','adp_c','gdp_c','pi_c','h_c'}];
+        txnCoeff = [p.aaCoeff,-4*p.length,-2*p.length,-6*p.length, ...
+            -ribosomeCost,1,4*p.length,2*p.length,6*p.length,6*p.length];
+        model = addReaction(model,'RPRAM_TRANSLATION', ...
+            'metaboliteList',txnMets,'stoichCoeffList',txnCoeff,'reversible',false);
+
+        foldATP = p.foldATPperAA*p.length*par.foldingATPmultiplier;
+        foldMets = {'rpram_unfolded_c','chap_pool_c','atp_c','h2o_c', ...
+            'rpram_partition_c','adp_c','pi_c','h_c'};
+        foldCoeff = [-1,-p.chaperoneCost,-foldATP,-foldATP, ...
+            1,foldATP,foldATP,foldATP];
+        model = addReaction(model,'RPRAM_FOLD', ...
+            'metaboliteList',foldMets,'stoichCoeffList',foldCoeff,'reversible',false);
+
+        model = addReaction(model,'RPRAM_PARTITION', ...
+            'metaboliteList',{'rpram_partition_c','rpram_sol_c','rpram_IB_c'}, ...
+            'stoichCoeffList',[-1,par.solubleFraction,1-par.solubleFraction], ...
+            'reversible',false);
+        model = addDemandReaction(model,'rpram_sol_c');
+        model = addDemandReaction(model,'rpram_IB_c');
+    else
+        txnMets = [p.aaMets,{'atp_c','gtp_c','h2o_c','ribo_pool_c', ...
+            'rani_HC_unfolded_c','rani_LC_unfolded_c', ...
+            'adp_c','gdp_c','pi_c','h_c'}];
+        txnCoeff = [p.aaCoeff,-4*p.length,-2*p.length,-6*p.length, ...
+            -ribosomeCost,1,1,4*p.length,2*p.length,6*p.length,6*p.length];
+        model = addReaction(model,'RANI_PAIR_TRANSLATION', ...
+            'metaboliteList',txnMets,'stoichCoeffList',txnCoeff,'reversible',false);
+
+        hcATP = p.foldATPperAA*p.HClength*par.foldingATPmultiplier;
+        lcATP = p.foldATPperAA*p.LClength*par.foldingATPmultiplier;
+        model = addReaction(model,'RANI_HC_FOLD', ...
+            'metaboliteList',{'rani_HC_unfolded_c','chap_pool_c','atp_c','h2o_c', ...
+            'rani_HC_folded_c','adp_c','pi_c','h_c'}, ...
+            'stoichCoeffList',[-1,-p.HCchaperoneCost,-hcATP,-hcATP, ...
+            1,hcATP,hcATP,hcATP],'reversible',false);
+        model = addReaction(model,'RANI_LC_FOLD', ...
+            'metaboliteList',{'rani_LC_unfolded_c','chap_pool_c','atp_c','h2o_c', ...
+            'rani_LC_folded_c','adp_c','pi_c','h_c'}, ...
+            'stoichCoeffList',[-1,-p.LCchaperoneCost,-lcATP,-lcATP, ...
+            1,lcATP,lcATP,lcATP],'reversible',false);
+
+        model = addReaction(model,'RANI_FAB_ASSEMBLY', ...
+            'metaboliteList',{'rani_HC_folded_c','rani_LC_folded_c', ...
+            'rani_fab_partition_c'},'stoichCoeffList',[-1,-1,1], ...
+            'reversible',false);
+        model = addReaction(model,'RANI_FAB_PARTITION', ...
+            'metaboliteList',{'rani_fab_partition_c','rani_fab_sol_c','rani_fab_IB_c'}, ...
+            'stoichCoeffList',[-1,par.solubleFraction,1-par.solubleFraction], ...
+            'reversible',false);
+        model = addDemandReaction(model,'rani_fab_sol_c');
+        model = addDemandReaction(model,'rani_fab_IB_c');
+    end
+end
+
+function rxn = resourceObjectiveRxn(p)
+    if strcmp(p.kind,'single')
+        rxn = 'DM_rpram_sol_c';
+    else
+        rxn = 'DM_rani_fab_sol_c';
+    end
+end
+
+function rxn = resourceIBDemandRxn(p)
+    if strcmp(p.kind,'single')
+        rxn = 'DM_rpram_IB_c';
+    else
+        rxn = 'DM_rani_fab_IB_c';
+    end
+end
+
+function value = experimentalSoluble(T,conditionName,p)
+    row = T.Condition == conditionName;
+    if strcmp(p.kind,'single')
+        value = T.rPramlintideSol_mmol_gDW_h(row);
+    else
+        value = T.RanibizumabSol_mmol_gDW_h(row);
+    end
+end
+
+function value = experimentalIB(T,conditionName,p)
+    row = T.Condition == conditionName;
+    if strcmp(p.kind,'single')
+        value = T.rPramlintideIB_mmol_gDW_h(row);
+    else
+        value = T.RanibizumabIB_mmol_gDW_h(row);
+    end
+end
+
+function value = fluxByRxn(solution,model,rxnID)
+    index = findRxnIDs(model,rxnID);
+    if index == 0
+        error('Reaction %s was not found when extracting flux.',rxnID);
+    end
+    value = solution.x(index);
+end
+
+function assertModelHasRxns(model,rxnIDs)
+    indices = findRxnIDs(model,rxnIDs);
+    missing = rxnIDs(indices == 0);
+    if ~isempty(missing)
+        error('Required reaction(s) missing from model: %s',strjoin(missing,', '));
+    end
+end
+
+function tf = isOptimalSolution(solution)
+    tf = isfield(solution,'stat') && solution.stat == 1 && ...
+         isfield(solution,'f') && ~isempty(solution.f) && isfinite(solution.f);
+end
+
+function requireOptimalSolution(solution,analysisName,conditionName)
+    if ~isOptimalSolution(solution)
+        error('%s was infeasible or non-optimal for condition %s.', ...
+            analysisName,conditionName);
+    end
+end
+
+function pct = safePercent(numerator,denominator)
+    if isempty(denominator) || ~isfinite(denominator) || denominator <= 1e-12
+        pct = NaN;
+    else
+        pct = 100*numerator/denominator;
+    end
+end
+
+function values = percentileTriplet(x)
+    values = [linearPercentile(x,5),linearPercentile(x,50), ...
+              linearPercentile(x,95)];
+end
+
+function value = linearPercentile(x,percent)
+    x = sort(x(isfinite(x)));
+    if isempty(x)
+        value = NaN;
+        return;
+    end
+    if numel(x) == 1
+        value = x;
+        return;
+    end
+    position = 1 + (numel(x)-1)*percent/100;
+    lowerIndex = floor(position);
+    upperIndex = ceil(position);
+    fraction = position-lowerIndex;
+    value = x(lowerIndex) + fraction*(x(upperIndex)-x(lowerIndex));
+end
+
+function flag = realizationFlag(medianTotalRealization)
+    if ~isfinite(medianTotalRealization)
+        flag = "not calculable";
+    elseif medianTotalRealization <= 100
+        flag = "within median constrained capacity";
+    else
+        flag = "experimental exceeds median constrained capacity";
+    end
+end
